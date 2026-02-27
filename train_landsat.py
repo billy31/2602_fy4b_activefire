@@ -629,11 +629,18 @@ def main():
     sampler = None
     try:
         all_counts = []
+        # 为了保证 sampler 的长度与实际 dataset 长度一致，基于每个 FireDataset 的 indices（train split）收集 fg_count
         if isinstance(train_ds, torch.utils.data.ConcatDataset):
             for ds in train_ds.datasets:
-                all_counts.extend([s.get('fg_count', 0) for s in ds.samples])
+                if hasattr(ds, 'indices') and len(ds.indices) > 0:
+                    all_counts.extend([ds.samples[i].get('fg_count', 0) for i in ds.indices])
+                else:
+                    all_counts.extend([s.get('fg_count', 0) for s in ds.samples])
         else:
-            all_counts = [s.get('fg_count', 0) for s in train_ds.samples]
+            if hasattr(train_ds, 'indices') and len(train_ds.indices) > 0:
+                all_counts = [train_ds.samples[i].get('fg_count', 0) for i in train_ds.indices]
+            else:
+                all_counts = [s.get('fg_count', 0) for s in train_ds.samples]
         if len(all_counts) > 0:
             weights = [1.0 / (c + 1) for c in all_counts]
             sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)

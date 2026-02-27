@@ -46,13 +46,14 @@ DEFAULT_TENSORBOARD_DIR = '/root/tf-logs'
 # ============================================================================
 
 class DiceLoss(nn.Module):
-    """Dice Loss - 直接优化IoU，对类别不平衡鲁棒"""
+    """Dice Loss - 使用sigmoid，适用于单通道输出"""
     def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
     
     def forward(self, pred, target):
-        probs = F.softmax(pred, dim=1)[:, 1, :, :]
+        # pred: [B, 1, H, W], target: [B, H, W]
+        probs = torch.sigmoid(pred).squeeze(1)  # [B, H, W]
         target_fg = (target == 1).float()
         
         intersection = (probs * target_fg).sum()
@@ -63,7 +64,7 @@ class DiceLoss(nn.Module):
 
 
 class FocalDiceLoss(nn.Module):
-    """Focal + Dice 组合"""
+    """Focal + Dice 组合 - 适用于单通道输出"""
     def __init__(self, dice_weight=1.0, focal_weight=0.5, gamma=2.0):
         super().__init__()
         self.dice_weight = dice_weight
@@ -75,10 +76,11 @@ class FocalDiceLoss(nn.Module):
         # Dice
         dice = self.dice(pred, target)
         
-        # Focal
-        ce = F.cross_entropy(pred, target, reduction='none')
-        pt = torch.exp(-ce)
-        focal = ((1 - pt) ** self.gamma * ce).mean()
+        # Focal (使用BCE)
+        bce = F.binary_cross_entropy_with_logits(pred.squeeze(1), target.float(), reduction='none')
+        probs = torch.sigmoid(pred).squeeze(1)
+        pt = probs * target.float() + (1 - probs) * (1 - target.float())
+        focal = ((1 - pt) ** self.gamma * bce).mean()
         
         return self.dice_weight * dice + self.focal_weight * focal
 
@@ -313,7 +315,7 @@ class FireDataset(Dataset):
 # 训练
 # ============================================================================
 
-def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
+def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, max_grad_norm=1.0):
     model.train()
     total_loss = 0
     tp = fp = fn = 0
@@ -327,12 +329,17 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
+            # 梯度裁剪 - 防止梯度爆炸
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
+            # 梯度裁剪 - 防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
         
         total_loss += loss.item()
@@ -538,6 +545,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--weight-decay', type=float, default=0.01)
+    parser.add_argument('--max-grad-norm', type=float, default=1.0,
+                       help='Max gradient norm for clipping (default: 1.0)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--warmup-epochs', type=int, default=5,
                        help='Warmup epochs, 5% of total (default: 5)')
@@ -626,7 +635,7 @@ def main():
             logger.info('Optimizer reinitialized with layer-wise lr')
         
         # 训练
-        train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp)
+        train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp, args.max_grad_norm)
         
         # 验证
         val_loss, val_f1, val_iou, val_p, val_r = validate(model, val_loader, criterion, device)

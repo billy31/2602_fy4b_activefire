@@ -343,7 +343,9 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, ma
             optimizer.step()
         
         total_loss += loss.item()
-        preds = outputs.argmax(dim=1)
+        # 单通道输出使用sigmoid阈值
+        probs = torch.sigmoid(outputs).squeeze(1)
+        preds = (probs > 0.5).long()
         tp += ((preds == 1) & (labels == 1)).sum().item()
         fp += ((preds == 1) & (labels == 0)).sum().item()
         fn += ((preds == 0) & (labels == 1)).sum().item()
@@ -374,7 +376,9 @@ def validate(model, loader, criterion, device):
         outputs = model(images)
         loss = criterion(outputs, labels)
         total_loss += loss.item()
-        preds = outputs.argmax(dim=1)
+        # 单通道输出使用sigmoid阈值
+        probs = torch.sigmoid(outputs).squeeze(1)
+        preds = (probs > 0.5).long()
         tp += ((preds == 1) & (labels == 1)).sum().item()
         fp += ((preds == 1) & (labels == 0)).sum().item()
         fn += ((preds == 0) & (labels == 1)).sum().item()

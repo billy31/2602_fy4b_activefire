@@ -1,10 +1,9 @@
 #!/usr/env/bin python3
 """
-Update 0227_redo_kimi_v3: 
-- 修正数据路径结构：/root/autodl-tmp/training/{region}/raw 和 mask_label
-- 修正文件名匹配逻辑：raw中无voting，mask_label中带voting
-- raw: LC08_L1TP_xxx_p00602.tif -> mask_label: LC08_L1TP_xxx_voting_p00602.tif
-- 保持其他优化：OHEM + Focal Loss + 加权采样 + MambaVision架构
+Update 0227_redo_kimi_v4: 
+- 修正TypeError: 处理is_positive为None的情况
+- 优化正负样本统计逻辑
+- 保持其他功能不变
 """
 
 import os
@@ -186,7 +185,6 @@ class LandsatDataset(Dataset):
         mask: LC08_L1TP_170024_20200812_20200812_01_RT_voting_p00602.tif
         """
         # 在_p之前插入_voting
-        # 匹配模式：xxx_p{数字}.tif -> xxx_voting_p{数字}.tif
         pattern = r'(.+)(_p\d+\.tif)$'
         match = re.match(pattern, raw_name)
         if match:
@@ -233,10 +231,17 @@ class LandsatDataset(Dataset):
 
         print(f"[Data] Total patches: {len(self.samples)}")
 
-        # 统计正负样本
+        # 统计正负样本 - 修正：避免None值
         if self.samples:
-            pos_count = sum([s.get('is_positive', False) for s in self.samples])
-            print(f"[Data] Positive patches: {pos_count}/{len(self.samples)} ({pos_count/max(len(self.samples),1)*100:.2f}%)")
+            # 延迟加载时不计算，只统计已知的
+            known_positives = [s.get('is_positive') for s in self.samples if s.get('is_positive') is not None]
+            pos_count = sum(known_positives) if known_positives else 0
+            known_count = len(known_positives)
+
+            if known_count > 0:
+                print(f"[Data] Known positive patches: {pos_count}/{known_count} ({pos_count/max(known_count,1)*100:.2f}%)")
+            else:
+                print(f"[Data] Positive patches: not yet calculated (lazy loading)")
 
     def _extract_patches(self, raw_file: Path, mask_file: Path, region: str):
         """从影像中提取patch位置"""
@@ -260,7 +265,7 @@ class LandsatDataset(Dataset):
                         'y': y,
                         'width': self.patch_size,
                         'height': self.patch_size,
-                        'is_positive': None  # 延迟加载
+                        'is_positive': False  # 默认False，避免None
                     })
         except Exception as e:
             print(f"[Error] Failed to process {raw_file}: {e}")
@@ -268,18 +273,19 @@ class LandsatDataset(Dataset):
     def check_positive(self, idx: int) -> bool:
         """检查patch是否包含正例"""
         sample = self.samples[idx]
-        if sample['is_positive'] is not None:
+        if sample.get('is_positive') is not None and sample['is_positive'] is not False:
             return sample['is_positive']
 
         try:
             with rasterio.open(sample['mask']) as src:
                 window = Window(sample['x'], sample['y'], self.patch_size, self.patch_size)
                 mask_data = src.read(1, window=window)
-                is_pos = (mask_data > 0).any()
+                is_pos = bool((mask_data > 0).any())  # 确保是bool类型
                 sample['is_positive'] = is_pos
                 return is_pos
         except Exception as e:
             print(f"[Error] Failed to read mask {sample['mask']}: {e}")
+            sample['is_positive'] = False
             return False
 
     def __len__(self):
@@ -331,7 +337,7 @@ class LandsatDataset(Dataset):
         return {
             'image': torch.from_numpy(image),
             'mask': torch.from_numpy(mask),
-            'is_positive': (mask > 0).any().item(),
+            'is_positive': bool((mask > 0).any()),  # 确保是bool
             'region': sample['region']
         }
 

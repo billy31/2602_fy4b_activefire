@@ -598,7 +598,7 @@ def main():
     
     # 模型
     pretrained_path = os.path.join(DEFAULT_PRETRAIN_DIR, 'mambavision_small_1k.pth') if args.pretrained else None
-    model = FireDetectionModel(args.model, 2, len(args.bands), args.pretrained, pretrained_path).to(device)
+    model = FireDetectionModel(args.model, 1, len(args.bands), args.pretrained, pretrained_path).to(device)
     logger.info(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     
     # 损失 - 简化版Dice

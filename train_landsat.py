@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-train_landsat.py - 火点检测优化版
+train_landsat.py - 火点检测综合优化版（全集成自动改进）
 GitHub: https://github.com/billy31/2602_fy4b_activefire
 
-优化重点：
-1. 简化损失函数 - 纯Dice Loss
-2. 数据过滤 - min_fg_pixels=50
-3. F1早停 - 3epoch无提升即停
-4. 冻结backbone训练策略
-5. 学习率warmup
+本次更新（主要改动）:
+1. 损失函数：Focal + Dice 组合（对类别不平衡更鲁棒），替代原先纯Dice
+2. 数据：支持 --use-all-regions 将 training 下所有地区合并训练；严格按 raw <-> mask_label (带_voting_) 一一配对
+3. 采样：基于每个样本的 fg_count 使用 WeightedRandomSampler 做过采样以缓解样本级不平衡
+4. 增强：增加随机旋转、亮度抖动、高斯噪声等同步增强，保证 image/mask 变换一致
+5. 训练稳定性：增加梯度累积（--accum-steps），混合精度（AMP），梯度裁剪，warmup+cosine lr调度
+6. 可伸缩性：支持冻结/解冻 backbone 的分段训练和 layer-wise lr
+7. 诊断工具：可视化预测、自动 git 提交保留
+
+使用说明（简要）:
+- 支持参数 --use-all-regions 与 --accum-steps，默认不合并所有地区，accum-steps=1
+- 推荐流程：先用小批量（bs=4, epochs=20）做过拟合测试，再用 --use-all-regions 增量训练
 """
 
 import os
@@ -308,6 +314,17 @@ class FireDataset(Dataset):
             k = np.random.randint(1, 4)  # 旋转90, 180, 或 270度
             img = np.rot90(img, k, axes=(1, 2)).copy()
             lbl = np.rot90(lbl, k).copy()
+        # 随机亮度抖动
+        if np.random.rand() < 0.5:
+            factor = 0.8 + 0.4 * np.random.rand()  # [0.8, 1.2]
+            img = img * factor
+        # 随机高斯噪声
+        if np.random.rand() < 0.3:
+            sigma = 0.005 + 0.02 * np.random.rand()
+            noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
+            img = img + noise
+        # 裁剪到合法范围
+        img = np.clip(img, 0.0, 1.0)
         return img, lbl
 
 
@@ -315,34 +332,37 @@ class FireDataset(Dataset):
 # 训练
 # ============================================================================
 
-def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, max_grad_norm=1.0):
+def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, max_grad_norm=1.0, accum_steps=1):
+    """训练一个epoch，支持梯度累积与AMP"""
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     tp = fp = fn = 0
+    optimizer.zero_grad()
     
     for i, (images, labels) in enumerate(loader):
         images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        
-        if use_amp:
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            # 梯度裁剪 - 防止梯度爆炸
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        with autocast(enabled=use_amp):
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels) / float(accum_steps)
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
             loss.backward()
-            # 梯度裁剪 - 防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
         
-        total_loss += loss.item()
+        # 梯度累积：每 accum_steps 步更新一次
+        if (i + 1) % accum_steps == 0:
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+            optimizer.zero_grad()
+        
+        # 恢复真实loss用于日志
+        total_loss += loss.item() * float(accum_steps)
         # 单通道输出使用sigmoid阈值
         probs = torch.sigmoid(outputs).squeeze(1)
         preds = (probs > 0.5).long()
@@ -354,7 +374,7 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, ma
             p = tp / (tp + fp + 1e-8) * 100
             r = tp / (tp + fn + 1e-8) * 100
             f1 = 2 * p * r / (p + r + 1e-8)
-            logger.info(f'  [{i}/{len(loader)}] Loss: {loss.item():.4f} P:{p:.1f}% R:{r:.1f}% F1:{f1:.1f}%')
+            logger.info(f'  [{i}/{len(loader)}] Loss: {loss.item()*accum_steps:.4f} P:{p:.1f}% R:{r:.1f}% F1:{f1:.1f}%')
     
     avg_loss = total_loss / len(loader)
     precision = tp / (tp + fp + 1e-8) * 100
@@ -565,6 +585,10 @@ def main():
     parser.add_argument('--use-amp', action='store_true', default=True)
     parser.add_argument('--tensorboard', action='store_true', default=True)
     parser.add_argument('--visualize', action='store_true', default=False)
+    parser.add_argument('--use-all-regions', action='store_true', default=False,
+                        help='If set, use all subdirectories under data-dir as regions for training')
+    parser.add_argument('--accum-steps', type=int, default=1,
+                        help='Gradient accumulation steps to simulate larger batch sizes (default:1)')
     
     args = parser.parse_args()
     
@@ -589,14 +613,39 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f'Device: {device}')
     
-    # 数据集
-    train_ds = FireDataset(args.data_dir, args.region, args.bands, 'train', 
-                          min_fg_pixels=args.min_fg_pixels)
-    val_ds = FireDataset(args.data_dir, args.region, args.bands, 'val',
-                        min_fg_pixels=args.min_fg_pixels)
+    # 数据集 (支持多区域合并训练与样本加权采样)
+    if args.use_all_regions:
+        regions = [d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))]
+        train_datasets = [FireDataset(args.data_dir, r, args.bands, 'train', min_fg_pixels=args.min_fg_pixels) for r in regions]
+        val_datasets = [FireDataset(args.data_dir, r, args.bands, 'val', min_fg_pixels=args.min_fg_pixels) for r in regions]
+        train_ds = torch.utils.data.ConcatDataset(train_datasets)
+        val_ds = torch.utils.data.ConcatDataset(val_datasets)
+        logger.info(f'Using all regions for training: {regions}')
+    else:
+        train_ds = FireDataset(args.data_dir, args.region, args.bands, 'train', min_fg_pixels=args.min_fg_pixels)
+        val_ds = FireDataset(args.data_dir, args.region, args.bands, 'val', min_fg_pixels=args.min_fg_pixels)
     
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                             num_workers=args.num_workers, pin_memory=True)
+    # 为了缓解样本级别不平衡，基于每个样本的fg_count做加权采样（越小的fg_count权重越大）
+    sampler = None
+    try:
+        all_counts = []
+        if isinstance(train_ds, torch.utils.data.ConcatDataset):
+            for ds in train_ds.datasets:
+                all_counts.extend([s.get('fg_count', 0) for s in ds.samples])
+        else:
+            all_counts = [s.get('fg_count', 0) for s in train_ds.samples]
+        if len(all_counts) > 0:
+            weights = [1.0 / (c + 1) for c in all_counts]
+            sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    except Exception as e:
+        logger.warning(f'Could not create sampler: {e}')
+    
+    if sampler is not None:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                                  num_workers=args.num_workers, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                            num_workers=args.num_workers, pin_memory=True)
     
@@ -605,9 +654,9 @@ def main():
     model = FireDetectionModel(args.model, 1, len(args.bands), args.pretrained, pretrained_path).to(device)
     logger.info(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     
-    # 损失 - 简化版Dice
-    criterion = DiceLoss()
-    logger.info('Using Dice Loss')
+    # 损失 - Focal + Dice 组合以缓解正负样本极度不平衡
+    criterion = FocalDiceLoss(dice_weight=1.0, focal_weight=1.0, gamma=2.0)
+    logger.info('Using Focal + Dice Loss')
     
     # 优化器
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -639,7 +688,7 @@ def main():
             logger.info('Optimizer reinitialized with layer-wise lr')
         
         # 训练
-        train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp, args.max_grad_norm)
+        train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp, args.max_grad_norm, accum_steps=args.accum_steps)
         
         # 验证
         val_loss, val_f1, val_iou, val_p, val_r = validate(model, val_loader, criterion, device)

@@ -255,46 +255,76 @@ class OHEMLoss(nn.Module):
         return hard_loss.mean()
 
 
-class FireLoss(nn.Module):
+class RecallFocusedLoss(nn.Module):
     """
-    火点专用组合损失 - 针对极度不平衡数据优化
-    
-    设计思路：
-    - Focal Loss: 处理类别不平衡，自动关注难样本
-    - Dice Loss: 直接优化IoU，对不平衡鲁棒
-    - Tversky Loss: 平衡假阳性和假阴性
-    - 中等fg_weight: 避免过度刺激前景预测
+    针对低Recall优化的损失函数
+    使用高alpha惩罚假阴性（漏检）
     """
-    def __init__(self, focal_weight=1.0, dice_weight=1.0, tversky_weight=1.0, 
-                 fg_weight=100.0, tversky_beta=0.5):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1.0):
         super().__init__()
-        self.fg_weight = fg_weight
-        self.focal_weight = focal_weight
-        self.dice_weight = dice_weight
-        self.tversky_weight = tversky_weight
-        
-        self.focal = FocalLoss(alpha=0.75, gamma=2.0)  # 提高alpha增加前景权重
-        self.dice = DiceLoss()
-        # 平衡的alpha/beta
-        self.tversky = TverskyLoss(alpha=1.0-tversky_beta, beta=tversky_beta)
+        self.alpha = alpha  # 高alpha关注假阴性
+        self.beta = beta
+        self.smooth = smooth
     
     def forward(self, pred, target):
-        # 带权重的CE作为基础
+        probs = F.softmax(pred, dim=1)[:, 1, :, :]
+        targets_fg = (target == 1).float()
+        
+        tp = (probs * targets_fg).sum()
+        fp = (probs * (1 - targets_fg)).sum()
+        fn = ((1 - probs) * targets_fg).sum()
+        
+        # 高alpha更惩罚fn（漏检）
+        recall_loss = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        return 1 - recall_loss
+
+
+class FireLoss(nn.Module):
+    """
+    火点专用组合损失 - 平衡Precision和Recall
+    
+    针对当前问题：Recall高(91%)但Precision极低(0.69%)
+    策略：
+    - 基础CE：稳定梯度
+    - Dice Loss：直接优化IoU
+    - Tversky Loss：可调整FP/FN平衡
+    - 动态权重：根据训练阶段调整
+    """
+    def __init__(self, fg_weight=500.0, tversky_beta=0.3, 
+                 use_recall_focus=False, recall_alpha=0.7):
+        super().__init__()
+        self.fg_weight = fg_weight
+        self.use_recall_focus = use_recall_focus
+        self.tversky_beta = tversky_beta
+        
+        self.dice = DiceLoss()
+        # tversky_beta控制FP惩罚力度
+        # beta=0.3：更关注Recall（当前需要）
+        # beta=0.5：平衡
+        # beta=0.7：更关注Precision
+        self.tversky = TverskyLoss(alpha=1.0-tversky_beta, beta=tversky_beta)
+        
+        if use_recall_focus:
+            self.recall_loss = RecallFocusedLoss(alpha=recall_alpha, beta=0.3)
+    
+    def forward(self, pred, target, epoch=0):
+        # 带权重的CE
         weight = torch.tensor([1.0, self.fg_weight], device=pred.device)
         ce = F.cross_entropy(pred, target, weight=weight)
         
-        # 其他损失
-        focal = self.focal(pred, target)
+        # Dice和Tversky
         dice = self.dice(pred, target)
         tversky = self.tversky(pred, target)
         
-        # 组合损失
-        total = (ce + 
-                self.focal_weight * focal + 
-                self.dice_weight * dice + 
-                self.tversky_weight * tversky)
+        # 基础组合
+        total = ce + dice + 2.0 * tversky
         
-        return total / 4.0  # 归一化
+        # 可选：添加Recall-focused loss
+        if self.use_recall_focus:
+            recall = self.recall_loss(pred, target)
+            total = total + recall
+        
+        return total
 
 
 # ============================================================================
@@ -387,7 +417,7 @@ class FireDataset(Dataset):
 # Training
 # ============================================================================
 
-def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
+def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp, epoch=0):
     model.train()
     total_loss = 0
     tp = fp = fn = 0
@@ -399,13 +429,13 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
         if use_amp:
             with autocast():
                 outputs = model(images)
-                loss = criterion(outputs, labels)
+                loss = criterion(outputs, labels, epoch)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels, epoch)
             loss.backward()
             optimizer.step()
         
@@ -424,12 +454,13 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
     precision = tp / (tp + fp + 1e-8) * 100
     recall = tp / (tp + fn + 1e-8) * 100
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    logger.info(f'Train - Loss: {avg_loss:.4f} P:{precision:.2f}% R:{recall:.2f}% F1:{f1:.2f}%')
-    return avg_loss
+    iou = tp / (tp + fp + fn + 1e-8) * 100
+    logger.info(f'Train - Loss: {avg_loss:.4f} IoU:{iou:.2f}% P:{precision:.2f}% R:{recall:.2f}% F1:{f1:.2f}%')
+    return avg_loss, iou, precision, recall, f1
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, epoch=0):
     model.eval()
     total_loss = 0
     tp = fp = fn = 0
@@ -437,7 +468,7 @@ def validate(model, loader, criterion, device):
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, labels, epoch)
         total_loss += loss.item()
         preds = outputs.argmax(dim=1)
         tp += ((preds == 1) & (labels == 1)).sum().item()
@@ -450,7 +481,7 @@ def validate(model, loader, criterion, device):
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     iou = tp / (tp + fp + fn + 1e-8) * 100
     logger.info(f'Val - Loss: {avg_loss:.4f} IoU:{iou:.2f}% P:{precision:.2f}% R:{recall:.2f}% F1:{f1:.2f}%')
-    return avg_loss, iou, precision, recall
+    return avg_loss, iou, precision, recall, f1
 
 
 # ============================================================================
@@ -471,12 +502,20 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--fg-weight', type=float, default=100.0, 
-                       help='Foreground class weight for CE loss (default: 100)')
-    parser.add_argument('--tversky-beta', type=float, default=0.5,
-                       help='Tversky beta (FP penalty), 0.5=balanced (default: 0.5)')
+    parser.add_argument('--fg-weight', type=float, default=500.0, 
+                       help='Foreground class weight for CE loss (default: 500)')
+    parser.add_argument('--tversky-beta', type=float, default=0.3,
+                       help='Tversky beta (FP penalty), lower=focus on recall (default: 0.3)')
     parser.add_argument('--use-amp', action='store_true', default=True)
     parser.add_argument('--tensorboard', action='store_true', default=True)
+    
+    # 早停参数
+    parser.add_argument('--early-stop-patience', type=int, default=20,
+                       help='Early stopping patience epochs (default: 20)')
+    parser.add_argument('--early-stop-min-delta', type=float, default=0.5,
+                       help='Minimum improvement for early stopping (default: 0.5%)')
+    parser.add_argument('--early-stop-min-epochs', type=int, default=30,
+                       help='Minimum epochs before early stopping (default: 30)')
     
     args = parser.parse_args()
     
@@ -513,32 +552,81 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = GradScaler() if args.use_amp else None
     
+    # 早停设置
     best_iou = 0.0
+    best_epoch = 0
+    epochs_no_improve = 0
+    early_stop_triggered = False
+    
+    logger.info(f'Early stopping: patience={args.early_stop_patience}, '
+                f'min_delta={args.early_stop_min_delta}%, min_epochs={args.early_stop_min_epochs}')
+    
     for epoch in range(1, args.epochs + 1):
         logger.info(f'\nEpoch {epoch}/{args.epochs}')
         logger.info('-' * 60)
         
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp)
-        val_loss, val_iou, val_p, val_r = validate(model, val_loader, criterion, device)
-        scheduler.step()
+        # 训练
+        train_loss, train_iou, train_p, train_r, train_f1 = train_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, args.use_amp, epoch)
         
+        # 验证
+        val_loss, val_iou, val_p, val_r, val_f1 = validate(
+            model, val_loader, criterion, device, epoch)
+        
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # TensorBoard记录 - 训练指标
         if writer:
+            # 损失
             writer.add_scalar('Loss/train', train_loss, epoch)
             writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('Metrics/IoU', val_iou, epoch)
-            writer.add_scalar('Metrics/P', val_p, epoch)
-            writer.add_scalar('Metrics/R', val_r, epoch)
+            
+            # 验证指标
+            writer.add_scalar('Metrics/Val_IoU', val_iou, epoch)
+            writer.add_scalar('Metrics/Val_Precision', val_p, epoch)
+            writer.add_scalar('Metrics/Val_Recall', val_r, epoch)
+            writer.add_scalar('Metrics/Val_F1', val_f1, epoch)
+            
+            # 训练指标
+            writer.add_scalar('Metrics/Train_IoU', train_iou, epoch)
+            writer.add_scalar('Metrics/Train_Precision', train_p, epoch)
+            writer.add_scalar('Metrics/Train_Recall', train_r, epoch)
+            writer.add_scalar('Metrics/Train_F1', train_f1, epoch)
+            
+            # 学习率
+            writer.add_scalar('Train/lr', current_lr, epoch)
+            
+            # 记录Precision-Recall平衡
+            writer.add_scalar('Balance/Val_P-R-Diff', abs(val_p - val_r), epoch)
+            writer.add_scalar('Balance/Train_P-R-Diff', abs(train_p - train_r), epoch)
         
-        if val_iou > best_iou:
+        # 保存最佳模型
+        if val_iou > best_iou + args.early_stop_min_delta:
             best_iou = val_iou
-            torch.save({'epoch': epoch, 'model': model.state_dict(), 'iou': val_iou, 'args': vars(args)}, 
+            best_epoch = epoch
+            epochs_no_improve = 0
+            torch.save({'epoch': epoch, 'model': model.state_dict(), 'iou': val_iou, 
+                       'precision': val_p, 'recall': val_r, 'args': vars(args)}, 
                       os.path.join(args.output_dir, 'best_model.pth'))
-            logger.info(f'Saved best model (IoU: {best_iou:.2f}%)')
+            logger.info(f'✓ Saved best model (IoU: {best_iou:.2f}%, P:{val_p:.2f}%, R:{val_r:.2f}%)')
+        else:
+            epochs_no_improve += 1
+            logger.info(f'  No improvement for {epochs_no_improve} epochs (best: {best_iou:.2f}% @ epoch {best_epoch})')
         
-        if epoch == 15 and best_iou < 15.0:
-            logger.warning(f'Warning: Best IoU {best_iou:.2f}% < 15% after 15 epochs')
+        # 早停检查
+        if epoch >= args.early_stop_min_epochs and epochs_no_improve >= args.early_stop_patience:
+            logger.warning(f'\n🛑 Early stopping triggered!')
+            logger.warning(f'   No improvement for {epochs_no_improve} epochs')
+            logger.warning(f'   Best IoU: {best_iou:.2f}% at epoch {best_epoch}')
+            early_stop_triggered = True
+            break
     
-    logger.info(f'\nTraining completed! Best IoU: {best_iou:.2f}%')
+    if not early_stop_triggered:
+        logger.info(f'\n✅ Training completed (all {args.epochs} epochs)')
+    
+    logger.info(f'🏆 Best result: IoU {best_iou:.2f}% (Precision {val_p:.2f}%, Recall {val_r:.2f}%) at epoch {best_epoch}')
+    
     if writer:
         writer.close()
 

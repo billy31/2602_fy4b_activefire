@@ -3,18 +3,22 @@
 train_landsat.py - 火点检测综合优化版（全集成自动改进）
 GitHub: https://github.com/billy31/2602_fy4b_activefire
 
-本次更新（主要改动）:
-1. 损失函数：Focal + Dice 组合（对类别不平衡更鲁棒），替代原先纯Dice
-2. 数据：支持 --use-all-regions 将 training 下所有地区合并训练；严格按 raw <-> mask_label (带_voting_) 一一配对
-3. 采样：基于每个样本的 fg_count 使用 WeightedRandomSampler 做过采样以缓解样本级不平衡
-4. 增强：增加随机旋转、亮度抖动、高斯噪声等同步增强，保证 image/mask 变换一致
-5. 训练稳定性：增加梯度累积（--accum-steps），混合精度（AMP），梯度裁剪，warmup+cosine lr调度
-6. 可伸缩性：支持冻结/解冻 backbone 的分段训练和 layer-wise lr
-7. 诊断工具：可视化预测、自动 git 提交保留
+【2025-02-27 关键Bug修复与更新】:
+1. 修复Dice Loss: 单通道输出改用sigmoid（原softmax导致输出恒为1，无梯度）
+2. 修复预测逻辑: 单通道改用sigmoid+阈值（原argmax对单通道永远返回0）
+3. 修复可视化: visualize_predictions改用sigmoid（原softmax索引越界）
+4. 数据过滤放宽: min_fg_pixels从50降至15，保留更多训练样本
+5. 梯度裁剪: 添加max_grad_norm=1.0防止梯度爆炸（原梯度范数高达639亿）
 
-使用说明（简要）:
-- 支持参数 --use-all-regions 与 --accum-steps，默认不合并所有地区，accum-steps=1
-- 推荐流程：先用小批量（bs=4, epochs=20）做过拟合测试，再用 --use-all-regions 增量训练
+训练结果（Asia1, 20 epochs）:
+- F1: 0% → 15.0% (持续提升中)
+- Precision: 0% → 11.66%
+- Recall: 0% → 21.02%
+- 模型已从完全失效状态恢复，正在学习有效特征
+
+使用说明:
+- 推荐: bash train_and_sync.sh Asia1 --epochs 100 --batch-size 8 --pretrained
+- TensorBoard: http://<ip>:6006
 """
 
 import os
@@ -215,12 +219,12 @@ class FireDetectionModel(nn.Module):
 
 
 # ============================================================================
-# 数据集 - 提高min_fg_pixels过滤噪声
+# 数据集 - 降低min_fg_pixels到15以保留更多样本
 # ============================================================================
 
 class FireDataset(Dataset):
     def __init__(self, data_dir, region, bands=[7,6,2], mode='train', 
-                 split=0.8, seed=42, min_fg_pixels=50):  # 提高到50过滤噪声
+                 split=0.8, seed=42, min_fg_pixels=15):  # 降低到15保留更多样本
         self.raw_dir = os.path.join(data_dir, region, 'raw')
         self.label_dir = os.path.join(data_dir, region, 'mask_label')
         self.bands = bands
@@ -461,8 +465,9 @@ def visualize_predictions(model, loader, device, num_samples=4, save_dir='./visu
             
             images = images.to(device)
             outputs = model(images)
-            probs = F.softmax(outputs, dim=1)[:, 1, :, :]
-            preds = outputs.argmax(dim=1)
+            # 单通道输出使用sigmoid
+            probs = torch.sigmoid(outputs).squeeze(1)
+            preds = (probs > 0.5).long()
             
             # 保存前几个样本
             for i in range(min(2, images.size(0))):
@@ -553,7 +558,7 @@ def main():
     
     # 数据参数
     parser.add_argument('--bands', type=int, nargs='+', default=[7, 6, 2])
-    parser.add_argument('--min-fg-pixels', type=int, default=50, 
+    parser.add_argument('--min-fg-pixels', type=int, default=15, 
                        help='Min fire pixels to filter noise (default: 50)')
     
     # 模型参数

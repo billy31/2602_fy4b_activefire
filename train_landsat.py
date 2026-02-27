@@ -202,12 +202,12 @@ class TverskyLoss(nn.Module):
     """
     Tversky Loss - 可调整假阴性(FN)和假阳性(FP)的权重
     alpha: FN权重 (漏检)
-    beta: FP权重 (误检) - 增加此值可抑制过度预测前景
+    beta: FP权重 (误检)
     """
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1.0):
+    def __init__(self, alpha=0.5, beta=0.5, smooth=1.0):
         super().__init__()
-        self.alpha = alpha  # 假阴性权重
-        self.beta = beta    # 假阳性权重 - 设为0.7以抑制过度预测
+        self.alpha = alpha
+        self.beta = beta
         self.smooth = smooth
     
     def forward(self, pred, target):
@@ -222,50 +222,79 @@ class TverskyLoss(nn.Module):
         return 1 - tversky
 
 
-class FocalTverskyLoss(nn.Module):
-    """Focal Tversky Loss - 对困难样本更敏感"""
-    def __init__(self, alpha=0.3, beta=0.7, gamma=4.0/3.0):
+class FocalLoss(nn.Module):
+    """
+    Focal Loss - 处理类别不平衡，让模型关注难分类样本
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
-        self.tversky = TverskyLoss(alpha, beta)
+        self.alpha = alpha
         self.gamma = gamma
     
     def forward(self, pred, target):
-        tversky_loss = self.tversky(pred, target)
-        return torch.pow(tversky_loss, self.gamma)
+        ce_loss = F.cross_entropy(pred, target, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+class OHEMLoss(nn.Module):
+    """
+    Online Hard Example Mining Loss
+    只使用最困难的样本进行反向传播
+    """
+    def __init__(self, ratio=0.7):
+        super().__init__()
+        self.ratio = ratio
+    
+    def forward(self, pred, target):
+        ce_loss = F.cross_entropy(pred, target, reduction='none')
+        # 选择损失最高的样本
+        num_hard = int(ce_loss.numel() * self.ratio)
+        hard_loss, _ = torch.topk(ce_loss.view(-1), num_hard)
+        return hard_loss.mean()
 
 
 class FireLoss(nn.Module):
     """
-    火点专用组合损失
-    针对极度不平衡数据：
-    - 使用高fg_weight增强前景梯度
-    - 使用高beta(0.7)惩罚假阳性（抑制过度预测前景）
-    - 组合CE + Tversky + Dice
+    火点专用组合损失 - 针对极度不平衡数据优化
+    
+    设计思路：
+    - Focal Loss: 处理类别不平衡，自动关注难样本
+    - Dice Loss: 直接优化IoU，对不平衡鲁棒
+    - Tversky Loss: 平衡假阳性和假阴性
+    - 中等fg_weight: 避免过度刺激前景预测
     """
-    def __init__(self, ce_weight=0.5, dice_weight=0.5, tversky_weight=2.0, 
-                 fg_weight=1000.0, tversky_beta=0.7):
+    def __init__(self, focal_weight=1.0, dice_weight=1.0, tversky_weight=1.0, 
+                 fg_weight=100.0, tversky_beta=0.5):
         super().__init__()
         self.fg_weight = fg_weight
-        self.ce_weight = ce_weight
+        self.focal_weight = focal_weight
         self.dice_weight = dice_weight
         self.tversky_weight = tversky_weight
         
+        self.focal = FocalLoss(alpha=0.75, gamma=2.0)  # 提高alpha增加前景权重
         self.dice = DiceLoss()
-        # 高beta惩罚假阳性，解决Precision低的问题
-        self.tversky = TverskyLoss(alpha=0.3, beta=tversky_beta)
+        # 平衡的alpha/beta
+        self.tversky = TverskyLoss(alpha=1.0-tversky_beta, beta=tversky_beta)
     
     def forward(self, pred, target):
-        # 带权重的CE
+        # 带权重的CE作为基础
         weight = torch.tensor([1.0, self.fg_weight], device=pred.device)
         ce = F.cross_entropy(pred, target, weight=weight)
         
-        # Dice和Tversky
+        # 其他损失
+        focal = self.focal(pred, target)
         dice = self.dice(pred, target)
         tversky = self.tversky(pred, target)
         
-        return (self.ce_weight * ce + 
+        # 组合损失
+        total = (ce + 
+                self.focal_weight * focal + 
                 self.dice_weight * dice + 
                 self.tversky_weight * tversky)
+        
+        return total / 4.0  # 归一化
 
 
 # ============================================================================
@@ -442,10 +471,10 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--fg-weight', type=float, default=1000.0, 
-                       help='Foreground class weight for CE loss (default: 1000)')
-    parser.add_argument('--tversky-beta', type=float, default=0.7,
-                       help='Tversky beta (FP penalty) for suppressing false positives (default: 0.7)')
+    parser.add_argument('--fg-weight', type=float, default=100.0, 
+                       help='Foreground class weight for CE loss (default: 100)')
+    parser.add_argument('--tversky-beta', type=float, default=0.5,
+                       help='Tversky beta (FP penalty), 0.5=balanced (default: 0.5)')
     parser.add_argument('--use-amp', action='store_true', default=True)
     parser.add_argument('--tensorboard', action='store_true', default=True)
     

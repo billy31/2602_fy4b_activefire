@@ -465,8 +465,10 @@ class FireDataset(Dataset):
         return result_img, result_lbl
 
     def get_sample_weights(self) -> List[float]:
+        # Weights must align with self.indices (train/val split)
         weights = []
-        for s in self.samples:
+        for idx in self.indices:
+            s = self.samples[int(idx)]
             weights.append(1.0 if s.get("fg_count", 0) > 0 else 0.25)
         return weights
 

@@ -32,7 +32,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 
 import rasterio
@@ -177,13 +178,13 @@ class FPNDecoder(nn.Module):
         self.lateral4 = nn.Conv2d(encoder_dims[3], 256, 1)
         self.lateral3 = nn.Conv2d(encoder_dims[2], 256, 1)
         self.lateral2 = nn.Conv2d(encoder_dims[1], 256, 1)
-        self.lateral1 = nn.Conv2d(encoder_dims[0], 128, 1)
+        self.lateral1 = nn.Conv2d(encoder_dims[0], 256, 1)
         self.smooth3 = nn.Conv2d(256, 256, 3, padding=1)
         self.smooth2 = nn.Conv2d(256, 256, 3, padding=1)
-        self.smooth1 = nn.Conv2d(128, 128, 3, padding=1)
+        self.smooth1 = nn.Conv2d(256, 256, 3, padding=1)
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.seg_head = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.Conv2d(256, 128, 3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.1),
@@ -548,7 +549,7 @@ def train_epoch(
     tp = fp = fn = 0
     for i, (images, labels) in enumerate(loader):
         images, labels = images.to(device), labels.to(device)
-        with autocast(enabled=use_amp):
+        with autocast("cuda", enabled=use_amp):
             outputs = model(images)
             loss = criterion(outputs.squeeze(1), labels.float())
         optimizer.zero_grad()

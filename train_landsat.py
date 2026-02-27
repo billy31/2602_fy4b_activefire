@@ -4,6 +4,10 @@ train_landsat.py - 火点检测深度优化版（三层架构改进）
 GitHub: https://github.com/billy31/2602_fy4b_activefire
 
 【2025-02-27 三层架构全面优化】:
+【2026-02-27 更新】
+- 标签统一二值化（label > 0），避免255/多类导致F1为0
+- 动态阈值搜索扩展到0.05-0.95
+- 加入负样本下采样，避免训练集全正导致验证阈值过高
 
 === LV-1: 采样与阈值优化 ===
 1. 修正采样权重：从"fg_count倒数"改为"困难样本挖掘+类别平衡"
@@ -119,7 +123,7 @@ class TverskyLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # pred: [B, 1, H, W], target: [B, H, W]
         probs = torch.sigmoid(pred).squeeze(1)
-        target_fg = (target == 1).float()
+        target_fg = (target > 0).float()
         
         # 逐样本计算再平均
         batch_size = pred.size(0)
@@ -151,7 +155,7 @@ class BoundaryLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # pred: [B, 1, H, W], target: [B, H, W]
         probs = torch.sigmoid(pred).squeeze(1)
-        target_fg = (target == 1).float()
+        target_fg = (target > 0).float()
         
         # 计算到边界的距离图（仅在CPU上预计算）
         with torch.no_grad():
@@ -191,7 +195,7 @@ class SizeWeightedFocalLoss(nn.Module):
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(pred).squeeze(1)
-        target_fg = (target == 1).float()
+        target_fg = (target > 0).float()
         
         batch_size = pred.size(0)
         total_loss = 0.0
@@ -443,12 +447,15 @@ class FireDatasetV2(Dataset):
     """
     def __init__(self, data_dir: str, region: str, bands: List[int] = [7, 6, 2],
                  mode: str = 'train', split: float = 0.8, seed: int = 42,
-                 min_fg_pixels: int = 10, use_global_norm: bool = True):
+                 min_fg_pixels: int = 10, use_global_norm: bool = True,
+                 neg_per_pos: float = 0.5):
         self.raw_dir = os.path.join(data_dir, region, 'raw')
         self.label_dir = os.path.join(data_dir, region, 'mask_label')
         self.bands = bands
         self.mode = mode
         self.use_global_norm = use_global_norm
+        self.neg_per_pos = max(0.0, float(neg_per_pos))
+        self.rng = np.random.default_rng(seed)
         
         # 扫描并过滤
         samples = self._scan_samples()
@@ -481,20 +488,38 @@ class FireDatasetV2(Dataset):
         return samples
     
     def _filter_fire(self, samples: List[Dict], min_fg: int) -> List[Dict]:
-        filtered = []
+        pos_samples = []
+        neg_samples = []
         for s in samples:
             try:
                 with rasterio.open(s['label']) as src:
                     label = src.read(1)
-                fg = (label == 1).sum()
+                label = self._binarize_label(label)
+                fg = (label > 0).sum()
+                s['fg_count'] = int(fg)
+                s['fg_ratio'] = fg / label.size
                 if fg >= min_fg:
-                    s['fg_count'] = int(fg)
-                    s['fg_ratio'] = fg / label.size
-                    filtered.append(s)
+                    pos_samples.append(s)
+                else:
+                    neg_samples.append(s)
             except:
                 pass
-        logger.info(f"Filtered: {len(filtered)}/{len(samples)} have >= {min_fg} fire pixels")
-        return filtered
+        if len(pos_samples) == 0:
+            kept = neg_samples
+            logger.warning("No positive samples found after filtering")
+        else:
+            neg_keep = int(len(pos_samples) * self.neg_per_pos)
+            if neg_keep <= 0:
+                kept = pos_samples
+            else:
+                if neg_keep >= len(neg_samples):
+                    neg_kept = neg_samples
+                else:
+                    idx = self.rng.choice(len(neg_samples), size=neg_keep, replace=False)
+                    neg_kept = [neg_samples[i] for i in idx]
+                kept = pos_samples + neg_kept
+        logger.info(f"Filtered: pos={len(pos_samples)}, neg_kept={len(kept)-len(pos_samples)} (neg_per_pos={self.neg_per_pos})")
+        return kept
     
     def __len__(self) -> int:
         return len(self.indices)
@@ -508,6 +533,7 @@ class FireDatasetV2(Dataset):
         
         with rasterio.open(s['label']) as src:
             label = src.read(1)
+        label = self._binarize_label(label)
         
         # 归一化
         image = self._normalize(image)
@@ -517,6 +543,10 @@ class FireDatasetV2(Dataset):
             image, label = self._augment(image, label)
         
         return torch.from_numpy(image).float(), torch.from_numpy(label.astype(np.int64))
+
+    @staticmethod
+    def _binarize_label(label: np.ndarray) -> np.ndarray:
+        return (label > 0).astype(np.uint8)
     
     def _normalize(self, image: np.ndarray) -> np.ndarray:
         """全局归一化 - 保留光谱关系"""
@@ -643,7 +673,7 @@ def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.Tens
     返回: (best_threshold, best_f1)
     """
     if thresholds is None:
-        thresholds = np.arange(0.1, 0.9, 0.05).tolist()
+        thresholds = np.linspace(0.05, 0.95, 19).tolist()
     
     model.eval()
     all_probs = []
@@ -665,9 +695,10 @@ def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.Tens
     
     for thresh in thresholds:
         preds = (all_probs > thresh).long()
-        tp = ((preds == 1) & (all_targets == 1)).sum().item()
-        fp = ((preds == 1) & (all_targets == 0)).sum().item()
-        fn = ((preds == 0) & (all_targets == 1)).sum().item()
+        gt = (all_targets > 0).long()
+        tp = ((preds == 1) & (gt == 1)).sum().item()
+        fp = ((preds == 1) & (gt == 0)).sum().item()
+        fn = ((preds == 0) & (gt == 1)).sum().item()
         
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
@@ -744,9 +775,10 @@ def train_epoch_v2(model: nn.Module, loader: DataLoader, criterion: nn.Module,
         # 计算指标
         probs = torch.sigmoid(seg_out).squeeze(1)
         preds = (probs > 0.5).long()
-        tp += ((preds == 1) & (labels == 1)).sum().item()
-        fp += ((preds == 1) & (labels == 0)).sum().item()
-        fn += ((preds == 0) & (labels == 1)).sum().item()
+        gt = (labels > 0).long()
+        tp += ((preds == 1) & (gt == 1)).sum().item()
+        fp += ((preds == 1) & (gt == 0)).sum().item()
+        fn += ((preds == 0) & (gt == 1)).sum().item()
         
         if i % 10 == 0:
             p = tp / (tp + fp + 1e-8) * 100
@@ -786,9 +818,10 @@ def validate_v2(model: nn.Module, loader: DataLoader, criterion: nn.Module,
         all_targets.append(labels.cpu())
         
         preds = (probs > threshold).long()
-        tp += ((preds == 1) & (labels == 1)).sum().item()
-        fp += ((preds == 1) & (labels == 0)).sum().item()
-        fn += ((preds == 0) & (labels == 1)).sum().item()
+        gt = (labels > 0).long()
+        tp += ((preds == 1) & (gt == 1)).sum().item()
+        fp += ((preds == 1) & (gt == 0)).sum().item()
+        fn += ((preds == 0) & (gt == 1)).sum().item()
         tn += ((preds == 0) & (labels == 0)).sum().item()
     
     avg_loss = total_loss / len(loader)
@@ -980,6 +1013,8 @@ def main():
     parser.add_argument('--bands', type=int, nargs='+', default=[5, 6, 7],
                        help='Bands to use (default: [5,6,7] - optimal for fire detection)')
     parser.add_argument('--min-fg-pixels', type=int, default=10)
+    parser.add_argument('--neg-per-pos', type=float, default=0.5,
+                       help='Keep negatives per positive (default: 0.5)')
     parser.add_argument('--no-global-norm', action='store_true',
                        help='Disable global normalization (use per-sample)')
     
@@ -1049,20 +1084,24 @@ def main():
                   if os.path.isdir(os.path.join(args.data_dir, d)) and not d.endswith('output')]
         train_datasets = [FireDatasetV2(args.data_dir, r, args.bands, 'train',
                                        min_fg_pixels=args.min_fg_pixels,
-                                       use_global_norm=not args.no_global_norm) for r in regions]
+                                       use_global_norm=not args.no_global_norm,
+                                       neg_per_pos=args.neg_per_pos) for r in regions]
         val_datasets = [FireDatasetV2(args.data_dir, r, args.bands, 'val',
                                      min_fg_pixels=args.min_fg_pixels,
-                                     use_global_norm=not args.no_global_norm) for r in regions]
+                                     use_global_norm=not args.no_global_norm,
+                                     neg_per_pos=args.neg_per_pos) for r in regions]
         train_ds = torch.utils.data.ConcatDataset(train_datasets)
         val_ds = torch.utils.data.ConcatDataset(val_datasets)
         logger.info(f'Using all regions: {regions}')
     else:
         train_ds = FireDatasetV2(args.data_dir, args.region, args.bands, 'train',
                                 min_fg_pixels=args.min_fg_pixels,
-                                use_global_norm=not args.no_global_norm)
+                                use_global_norm=not args.no_global_norm,
+                                neg_per_pos=args.neg_per_pos)
         val_ds = FireDatasetV2(args.data_dir, args.region, args.bands, 'val',
                               min_fg_pixels=args.min_fg_pixels,
-                              use_global_norm=not args.no_global_norm)
+                              use_global_norm=not args.no_global_norm,
+                              neg_per_pos=args.neg_per_pos)
     
     # 困难样本挖掘采样器
     sampler = None

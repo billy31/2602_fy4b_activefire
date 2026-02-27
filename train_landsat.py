@@ -198,19 +198,74 @@ class DiceLoss(nn.Module):
         return 1 - (2. * intersection + self.smooth) / (union + self.smooth)
 
 
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss - 可调整假阴性(FN)和假阳性(FP)的权重
+    alpha: FN权重 (漏检)
+    beta: FP权重 (误检) - 增加此值可抑制过度预测前景
+    """
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha  # 假阴性权重
+        self.beta = beta    # 假阳性权重 - 设为0.7以抑制过度预测
+        self.smooth = smooth
+    
+    def forward(self, pred, target):
+        probs = F.softmax(pred, dim=1)[:, 1, :, :]
+        targets_fg = (target == 1).float()
+        
+        tp = (probs * targets_fg).sum()
+        fp = (probs * (1 - targets_fg)).sum()
+        fn = ((1 - probs) * targets_fg).sum()
+        
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+        return 1 - tversky
+
+
+class FocalTverskyLoss(nn.Module):
+    """Focal Tversky Loss - 对困难样本更敏感"""
+    def __init__(self, alpha=0.3, beta=0.7, gamma=4.0/3.0):
+        super().__init__()
+        self.tversky = TverskyLoss(alpha, beta)
+        self.gamma = gamma
+    
+    def forward(self, pred, target):
+        tversky_loss = self.tversky(pred, target)
+        return torch.pow(tversky_loss, self.gamma)
+
+
 class FireLoss(nn.Module):
-    def __init__(self, ce_weight=1.0, dice_weight=1.0, fg_weight=500.0):
+    """
+    火点专用组合损失
+    针对极度不平衡数据：
+    - 使用高fg_weight增强前景梯度
+    - 使用高beta(0.7)惩罚假阳性（抑制过度预测前景）
+    - 组合CE + Tversky + Dice
+    """
+    def __init__(self, ce_weight=0.5, dice_weight=0.5, tversky_weight=2.0, 
+                 fg_weight=1000.0, tversky_beta=0.7):
         super().__init__()
         self.fg_weight = fg_weight
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
+        self.tversky_weight = tversky_weight
+        
         self.dice = DiceLoss()
+        # 高beta惩罚假阳性，解决Precision低的问题
+        self.tversky = TverskyLoss(alpha=0.3, beta=tversky_beta)
     
     def forward(self, pred, target):
+        # 带权重的CE
         weight = torch.tensor([1.0, self.fg_weight], device=pred.device)
         ce = F.cross_entropy(pred, target, weight=weight)
+        
+        # Dice和Tversky
         dice = self.dice(pred, target)
-        return self.ce_weight * ce + self.dice_weight * dice
+        tversky = self.tversky(pred, target)
+        
+        return (self.ce_weight * ce + 
+                self.dice_weight * dice + 
+                self.tversky_weight * tversky)
 
 
 # ============================================================================
@@ -387,7 +442,10 @@ def main():
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--fg-weight', type=float, default=500.0)
+    parser.add_argument('--fg-weight', type=float, default=1000.0, 
+                       help='Foreground class weight for CE loss (default: 1000)')
+    parser.add_argument('--tversky-beta', type=float, default=0.7,
+                       help='Tversky beta (FP penalty) for suppressing false positives (default: 0.7)')
     parser.add_argument('--use-amp', action='store_true', default=True)
     parser.add_argument('--tensorboard', action='store_true', default=True)
     
@@ -415,7 +473,8 @@ def main():
     model = MambaVisionDeepLab(args.model, 2, len(args.bands), args.pretrained, pretrained_path).to(device)
     logger.info(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
     
-    criterion = FireLoss(fg_weight=args.fg_weight)
+    criterion = FireLoss(fg_weight=args.fg_weight, tversky_beta=args.tversky_beta)
+    logger.info(f'Using FireLoss: fg_weight={args.fg_weight}, tversky_beta={args.tversky_beta}')
     
     backbone_params, decoder_params = [], []
     for name, p in model.named_parameters():

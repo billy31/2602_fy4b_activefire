@@ -293,12 +293,19 @@ class FireDataset(Dataset):
         return torch.from_numpy(image).float(), torch.from_numpy(label.astype(np.int64))
     
     def _augment(self, img, lbl):
+        # 随机水平翻转
         if np.random.rand() > 0.5:
             img = np.flip(img, axis=2).copy()
             lbl = np.flip(lbl, axis=1).copy()
+        # 随机垂直翻转
         if np.random.rand() > 0.5:
             img = np.flip(img, axis=1).copy()
             lbl = np.flip(lbl, axis=0).copy()
+        # 随机旋转90度（新增）
+        if np.random.rand() > 0.5:
+            k = np.random.randint(1, 4)  # 旋转90, 180, 或 270度
+            img = np.rot90(img, k, axes=(1, 2)).copy()
+            lbl = np.rot90(lbl, k).copy()
         return img, lbl
 
 
@@ -468,6 +475,39 @@ def visualize_predictions(model, loader, device, num_samples=4, save_dir='./visu
 
 
 # ============================================================================
+# Git自动提交功能
+# ============================================================================
+
+def git_commit_auto(message):
+    """自动提交代码变更到Git"""
+    try:
+        import subprocess
+        
+        # 检查是否有变更
+        result = subprocess.run(['git', 'status', '--porcelain'], 
+                              capture_output=True, text=True, cwd='/root/codes/fire0226/selfCodes')
+        
+        if result.stdout.strip():
+            # 有变更，执行提交
+            subprocess.run(['git', 'add', '-A'], cwd='/root/codes/fire0226/selfCodes', check=True)
+            subprocess.run(['git', 'commit', '-m', message], cwd='/root/codes/fire0226/selfCodes', check=True)
+            
+            # 尝试推送
+            push_result = subprocess.run(['git', 'push', 'origin', 'main'], 
+                                        capture_output=True, text=True, 
+                                        cwd='/root/codes/fire0226/selfCodes')
+            if push_result.returncode == 0:
+                logger.info(f'✅ Git synced: {message[:50]}...')
+            else:
+                logger.warning('⚠️ Git commit OK but push failed')
+        else:
+            logger.info('ℹ️ No code changes to commit')
+            
+    except Exception as e:
+        logger.warning(f'⚠️ Git auto-commit failed: {e}')
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -493,12 +533,14 @@ def main():
     
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--batch-size', type=int, default=8,
+                       help='Batch size (default: 8)')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate (default: 1e-4)')
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--warmup-epochs', type=int, default=10,
-                       help='Warmup epochs (default: 10)')
+    parser.add_argument('--warmup-epochs', type=int, default=5,
+                       help='Warmup epochs, 5% of total (default: 5)')
     
     # 早停参数 - 基于F1
     parser.add_argument('--early-stop-patience', type=int, default=3,
@@ -512,6 +554,9 @@ def main():
     parser.add_argument('--visualize', action='store_true', default=False)
     
     args = parser.parse_args()
+    
+    # 训练前自动提交
+    git_commit_auto(f"Pre-train: Start training {args.region} with lr={args.lr}, bs={args.batch_size}")
     
     torch.manual_seed(42)
     np.random.seed(42)
@@ -568,13 +613,17 @@ def main():
         logger.info(f'\nEpoch {epoch}/{args.epochs} (lr={current_lr:.2e})')
         logger.info('-' * 60)
         
-        # 阶段性解冻backbone
+        # 阶段性解冻backbone - 更灵活的策略
         if epoch == 1 and args.freeze_backbone_epochs > 0:
             model.freeze_backbone()
         elif epoch == args.freeze_backbone_epochs + 1:
             model.unfreeze_backbone()
-            # 重新初始化优化器（可选）
-            optimizer = AdamW(model.parameters(), lr=args.lr * 0.5, weight_decay=args.weight_decay)
+            # 解冻后使用较小的学习率
+            optimizer = AdamW([
+                {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
+                {'params': model.decoder.parameters(), 'lr': args.lr}
+            ], weight_decay=args.weight_decay)
+            logger.info('Optimizer reinitialized with layer-wise lr')
         
         # 训练
         train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device, scaler, args.use_amp)
@@ -621,6 +670,9 @@ def main():
         visualize_predictions(model, val_loader, device)
     
     logger.info(f'\n🏆 Best: F1 {best_f1:.2f}% (P:{val_p:.1f}%, R:{val_r:.1f}%) @ epoch {best_epoch}')
+    
+    # 训练后自动提交
+    git_commit_auto(f"Post-train: {args.region} best F1={best_f1:.2f}% @ epoch {best_epoch}")
     
     if writer:
         writer.close()
